@@ -1,0 +1,46 @@
+{
+  "servers": [
+    {
+      "name": "filesystem",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "${WORKSPACE}"
+      ],
+      "enabled": true
+    },
+    {
+      "name": "playwright",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@latest",
+        "--browser",
+        "msedge",
+        "--headless",
+        "--output-dir",
+        "${ROOT}/data/runtime/playwright"
+      ],
+      "enabled": true
+    },
+    {
+      "name": "fetch",
+      "command": "uvx",
+      "args": [
+        "mcp-server-fetch"
+      ],
+      "enabled": false
+    },
+    {
+      "name": "git",
+      "command": "uvx",
+      "args": [
+        "mcp-server-git",
+        "--repository",
+        "${ROOT}"
+      ],
+      "enabled": false
+    }
+  ]
+}
