@@ -68,7 +68,7 @@ func (e *Executor) Execute(ctx context.Context, call llm.ToolCall, emit func(Eve
 		writePath = argPath(call.Function.Arguments)
 		if writePath != "" && e.Writes[writePath] >= 2 {
 			msg := fmt.Sprintf("拒绝重复写入：%s 已成功写入 %d 次。请改为写入缺失文件或修复构建错误，不要重写已完成内容。", writePath, e.Writes[writePath])
-			emit(Event{Type: "tool_result", Name: call.Function.Name, Text: msg, Output: msg, OK: false})
+			emit(Event{Type: "tool_result", Name: call.Function.Name, Args: args, Text: msg, Output: msg, OK: false})
 			e.Errors++
 			e.ConsecutiveErrors++
 			return "[ERROR] " + msg, false
@@ -80,7 +80,7 @@ func (e *Executor) Execute(ctx context.Context, call llm.ToolCall, emit func(Eve
 		readPath = argPath(call.Function.Arguments)
 		if readPath != "" && e.Reads[readPath] >= 1 {
 			msg := fmt.Sprintf("拒绝重复读取：%s 本次任务已读取过，内容已在上文。请直接 write_file 修复，或读取其他尚未看过的文件。", readPath)
-			emit(Event{Type: "tool_result", Name: call.Function.Name, Text: msg, Output: msg, OK: false})
+			emit(Event{Type: "tool_result", Name: call.Function.Name, Args: args, Text: msg, Output: msg, OK: false})
 			e.Errors++
 			e.ConsecutiveErrors++
 			return "[ERROR] " + msg, false
@@ -117,6 +117,7 @@ func (e *Executor) Execute(ctx context.Context, call llm.ToolCall, emit func(Eve
 	emit(Event{
 		Type:   "tool_result",
 		Name:   call.Function.Name,
+		Args:   args,
 		Text:   textutil.Truncate(display, 4000),
 		Output: textutil.Truncate(display, 4000),
 		OK:     ok,

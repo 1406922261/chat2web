@@ -20,7 +20,7 @@
         "msedge",
         "--headless",
         "--output-dir",
-        "${ROOT}/data/runtime/playwright"
+        "${ROOT}/data/logs/runtime/playwright"
       ],
       "enabled": true
     },

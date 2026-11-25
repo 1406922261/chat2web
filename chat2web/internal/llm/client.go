@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -73,6 +75,8 @@ type Client struct {
 	Temperature float64
 	MaxTokens   int
 	HTTP        *http.Client
+	// OnProgress 在调用方没有接入流式输出时周期性上报等待进度，避免终端长时间无反馈。
+	OnProgress func(string)
 }
 
 func New(baseURL, apiKey, model string, temperature float64, maxTokens int) *Client {
@@ -166,6 +170,8 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []ToolDef, onDe
 			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
 			if onDelta != nil {
 				onDelta("\n[连接中断，已自动重试…]\n")
+			} else if c.OnProgress != nil {
+				c.OnProgress(fmt.Sprintf("LLM 调用中断，正在重试（%d/3）：%v", attempt+1, err))
 			}
 			// 重试时不再重复输出增量，避免终端出现重复内容。
 			onDelta = nil
@@ -194,6 +200,33 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	req.Header.Set("Accept", "text/event-stream")
+
+	// 没有流式回调时，用心跳把等待进度暴露到终端，覆盖建连、首字节与流式读取全过程。
+	var received atomic.Int64
+	stopProgress := make(chan struct{})
+	var progressWG sync.WaitGroup
+	if c.OnProgress != nil && onDelta == nil {
+		progressWG.Add(1)
+		go func() {
+			defer progressWG.Done()
+			start := time.Now()
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopProgress:
+					return
+				case <-ticker.C:
+					c.OnProgress(fmt.Sprintf("模型响应中… 已等待 %d 秒，已接收 %d 字符", int(time.Since(start).Seconds()), received.Load()))
+				}
+			}
+		}()
+		defer func() {
+			close(stopProgress)
+			progressWG.Wait()
+		}()
+	}
+
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("调用 LLM 失败: %w", err)
@@ -223,6 +256,7 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 			continue
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		received.Add(int64(len(data)))
 		if data == "[DONE]" {
 			break
 		}

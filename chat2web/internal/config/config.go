@@ -26,13 +26,16 @@ type Config struct {
 	SkillsRoot    string
 	ConfigsRoot   string
 	MCPConfigPath string
+	MemoryRoot    string
+	SessionsRoot  string
+	BackupsRoot   string
 	ReportsRoot   string
 	TasksRoot     string
-	MemoryRoot    string
 	RuntimeRoot   string
 
 	RetentionPlaywrightDays int
 	RetentionTaskDays       int
+	RetentionSessionDays    int
 	ReportsKeep             int
 	MemoryTokenBudget       int
 
@@ -61,19 +64,26 @@ func Load() *Config {
 		LLMMaxTokens:   envInt("LLM_MAX_TOKENS", 8192),
 		LLMTimeout:     time.Duration(envInt("LLM_TIMEOUT_SECONDS", 240)) * time.Second,
 		Root:           root,
-		WorkspaceRoot:  filepath.Join(root, "workspace"),
-		ProjectsRoot:   filepath.Join(root, "workspace", "projects"),
-		DataRoot:       filepath.Join(root, "data"),
-		SkillsRoot:     filepath.Join(root, "skills"),
-		ConfigsRoot:    filepath.Join(root, "configs"),
-		MCPConfigPath:  filepath.Join(root, "configs", "mcp.json"),
-		ReportsRoot:    filepath.Join(root, "data", "reports"),
-		TasksRoot:      filepath.Join(root, "data", "tasks"),
-		MemoryRoot:     filepath.Join(root, "data", "memory"),
-		RuntimeRoot:    filepath.Join(root, "data", "runtime"),
+		// 项目统一存放在 data/projects/{project_id}，一个项目只有一个目录。
+		// WorkspaceRoot 作为 Shell/MCP 的工作根，指向同一位置。
+		WorkspaceRoot: filepath.Join(root, "data", "projects"),
+		ProjectsRoot:  filepath.Join(root, "data", "projects"),
+		DataRoot:      filepath.Join(root, "data"),
+		SkillsRoot:    filepath.Join(root, "skills"),
+		ConfigsRoot:   filepath.Join(root, "configs"),
+		MCPConfigPath: filepath.Join(root, "configs", "mcp.json"),
+		// 记忆分层：全局记忆在 data/memory，会话摘要与备份分别落在 data/sessions、data/backups。
+		MemoryRoot:   filepath.Join(root, "data", "memory"),
+		SessionsRoot: filepath.Join(root, "data", "sessions"),
+		BackupsRoot:  filepath.Join(root, "data", "backups"),
+		// 临时数据只保留在两处：报告成果归 data/exports，运行日志归 data/logs。
+		ReportsRoot: filepath.Join(root, "data", "exports", "reports"),
+		TasksRoot:   filepath.Join(root, "data", "sessions", "tasks"),
+		RuntimeRoot: filepath.Join(root, "data", "logs", "runtime"),
 
 		RetentionPlaywrightDays: envInt("MEMORY_RETENTION_PLAYWRIGHT_DAYS", 3),
 		RetentionTaskDays:       envInt("MEMORY_RETENTION_TASK_DAYS", 7),
+		RetentionSessionDays:    envInt("MEMORY_SESSION_DAYS", 7),
 		ReportsKeep:             envInt("MEMORY_REPORTS_KEEP", 10),
 		MemoryTokenBudget:       envInt("MEMORY_TOKEN_BUDGET", 2400),
 
@@ -111,18 +121,18 @@ func Load() *Config {
 	cfg.LLMBaseURL = strings.TrimRight(cfg.LLMBaseURL, "/")
 
 	for _, dir := range []string{
-		cfg.WorkspaceRoot,
+		cfg.DataRoot,
 		cfg.ProjectsRoot,
-		filepath.Join(cfg.MemoryRoot, "sessions"),
-		filepath.Join(cfg.MemoryRoot, "projects"),
-		filepath.Join(cfg.MemoryRoot, "backup"),
+		cfg.MemoryRoot,
+		cfg.SessionsRoot,
+		cfg.BackupsRoot,
 		filepath.Join(cfg.RuntimeRoot, "playwright"),
 		filepath.Join(cfg.RuntimeRoot, "shell"),
 		filepath.Join(cfg.RuntimeRoot, "screenshots"),
 		filepath.Join(cfg.RuntimeRoot, "tmp"),
 		filepath.Join(cfg.RuntimeRoot, "reports-tmp"),
 		filepath.Join(cfg.RuntimeRoot, "tasks-tmp"),
-		filepath.Join(cfg.DataRoot, "projects"),
+		filepath.Join(cfg.RuntimeRoot, "tools"),
 		filepath.Join(cfg.DataRoot, "logs"),
 		filepath.Join(cfg.DataRoot, "exports"),
 		cfg.ReportsRoot,
@@ -144,15 +154,17 @@ func detectRoot() string {
 	if err != nil {
 		return "."
 	}
-	// 允许从 chat2web 或其 cmd 子目录启动 go run ./cmd/main.go
-	switch strings.ToLower(filepath.Base(wd)) {
-	case "cmd":
-		return filepath.Dir(wd)
-	case "chat2web":
-		return wd
-	default:
-		return wd
+	// 从当前目录向上查找同时带 go.mod 的目录，兼容 go run ./cmd/server 与在 cmd/server 内 go run .
+	for dir := wd; ; dir = filepath.Dir(dir) {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
 	}
+	return wd
 }
 
 func loadDotEnv(path string) error {

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"chat2web/internal/config"
@@ -49,7 +50,8 @@ const systemCore = `你是 Chat2Web AI，一个能够把终端聊天内容转化
 - 一次响应可以同时返回多个工具调用：互不依赖的文件（多个页面、多个组件）应在同一响应中一起 write_file，减少往返次数。
 - 脚手架已生成 package.json、vite.config.ts、tailwind.config.js、postcss.config.js、index.html、src/main.tsx，除非发现错误，不要重写这些配置文件。
 - 单个源码文件控制在 120 行以内；多个互不依赖的小文件（如 2-3 个页面/组件）应在同一次响应中一起 write_file，减少往返轮次。文件过大时模型输出会被长度上限截断，导致工具参数不是合法 JSON。
-- 系统最多允许 6 轮决策：请优先用 2-3 轮写完所有页面与组件，不要在已完成后反复检查或重写同一批文件。
+- 系统最多允许 {{MAX_STEPS}} 轮决策：请优先用 {{TARGET_STEPS}} 轮写完所有页面与组件，不要在已完成后反复检查或重写同一批文件。
+- 先写 src/types.ts 与 src/data 下的数据文件，把它们当作唯一数据源；页面与组件只能引用其中**已经导出**的成员和字段，禁止假设未定义的属性（否则 tsc 报 TS2305/TS2339）。数据文件与页面必须同一次写入完成，避免两边命名脱节。
 - 在 src/components 中复用共享组件与统一样式，不要在每个页面重复大段代码。
 - 修改项目源码统一使用内置 write_file（写完整文件）；不要用 MCP filesystem 的 edit_file 修改源码。
 - 在 App.tsx / 页面组件中 import 的每个本地文件都必须真实存在；先创建文件，再写 import，避免 Vite 报 Failed to resolve import。
@@ -80,7 +82,21 @@ const systemCore = `你是 Chat2Web AI，一个能够把终端聊天内容转化
 `
 
 // SystemCore 返回固定不变的系统规则（不含任何动态内容）。
-func (c *ContextManager) SystemCore() string { return systemCore }
+func (c *ContextManager) SystemCore() string {
+	steps := 0
+	if c.Cfg != nil {
+		steps = c.Cfg.MaxAgentSteps
+	}
+	if steps <= 0 {
+		steps = 6
+	}
+	target := steps / 3
+	if target < 2 {
+		target = 2
+	}
+	out := strings.Replace(systemCore, "{{MAX_STEPS}}", strconv.Itoa(steps), 1)
+	return strings.Replace(out, "{{TARGET_STEPS}}", fmt.Sprintf("%d-%d", target, target+2), 1)
+}
 
 // TaskInput 是任务上下文所需的动态信息。
 type TaskInput struct {

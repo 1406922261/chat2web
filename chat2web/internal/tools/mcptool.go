@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"chat2web/internal/llm"
-	"chat2web/internal/mcp"
+	"chat2web/internal/tools/mcp"
 )
 
 // MCPTool 将 MCP Server 提供的工具包装成 Agent 可调用的工具。

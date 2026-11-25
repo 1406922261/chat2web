@@ -6,9 +6,260 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"chat2web/internal/textutil"
 )
+
+// 记忆文件采用 Markdown + 行内 HTML 注释元数据：
+// 人类可直接阅读/编辑，程序也能稳定解析，避免额外的结构化文件。
+
+func singleLine(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	return strings.TrimSpace(s)
+}
+
+func sanitizeAttr(s string) string {
+	s = singleLine(s)
+	s = strings.ReplaceAll(s, ";", "；")
+	s = strings.ReplaceAll(s, ",", "，")
+	return s
+}
+
+func parseAttrs(line string) map[string]string {
+	line = strings.TrimSpace(line)
+	line = strings.TrimPrefix(line, "<!-- memory:")
+	line = strings.TrimSuffix(line, "-->")
+	out := map[string]string{}
+	for _, part := range strings.Split(line, ";") {
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		out[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	return out
+}
+
+func renderEntryLine(e Entry) string {
+	return renderEntryLineQualified(e, e.ProjectID != "")
+}
+
+func renderEntryLineQualified(e Entry, qualified bool) string {
+	key := singleLine(e.Key)
+	if qualified && e.ProjectID != "" {
+		key = "[" + e.ProjectID + "] " + key
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "- **%s**：%s\n", key, singleLine(e.Value))
+	parts := []string{
+		"id=" + e.ID,
+		"kind=" + e.Kind,
+		"tags=" + strings.Join(e.Tags, "，"),
+		"source=" + e.Source,
+	}
+	if e.Pinned {
+		parts = append(parts, "pinned=1")
+	}
+	parts = append(parts, "updated="+e.UpdatedAt.Format(time.RFC3339))
+	fmt.Fprintf(&b, "  <!-- memory:%s -->\n", strings.Join(parts, ";"))
+	return b.String()
+}
+
+func sectionKind(title string) string {
+	switch strings.TrimSpace(title) {
+	case "偏好", "设计偏好":
+		return "preference"
+	case "技术栈":
+		return "tech"
+	case "其他事实", "事实":
+		return "fact"
+	case "项目相关记忆", "项目":
+		return "project"
+	}
+	return ""
+}
+
+func kindTitle(kind string) string {
+	switch kind {
+	case "preference":
+		return "偏好"
+	case "tech":
+		return "技术栈"
+	case "fact":
+		return "其他事实"
+	case "project":
+		return "项目相关记忆"
+	}
+	return "其他事实"
+}
+
+// renderUserMemory 渲染 memory/memory.md。
+func renderUserMemory(entries []Entry, manual string, updated time.Time) string {
+	var b strings.Builder
+	b.WriteString("# 用户长期记忆\n\n")
+	b.WriteString("> 由 Chat2Web 自动维护：会话结束时会增量更新，避免重复记录。\n")
+	b.WriteString("> 可直接编辑「手动备注」；其余条目由系统生成，建议通过记忆管理菜单修改。\n")
+	fmt.Fprintf(&b, "> 更新时间：%s\n\n", updated.Format("2006-01-02 15:04:05"))
+
+	order := []string{"preference", "tech", "fact", "project"}
+	has := map[string]bool{}
+	for _, e := range entries {
+		has[e.Kind] = true
+	}
+	for _, kind := range order {
+		if !has[kind] {
+			continue
+		}
+		fmt.Fprintf(&b, "## %s\n", kindTitle(kind))
+		for _, e := range entries {
+			if e.Kind == kind {
+				b.WriteString(renderEntryLine(e))
+			}
+		}
+		b.WriteString("\n")
+	}
+	if len(entries) == 0 {
+		b.WriteString("## 偏好\n- 暂无记录，等待首次会话后自动提取。\n\n")
+	}
+	b.WriteString("## 手动备注\n\n")
+	if strings.TrimSpace(manual) != "" {
+		b.WriteString(strings.TrimSpace(manual))
+		b.WriteString("\n")
+	} else {
+		b.WriteString("（可在此处补充希望 Agent 长期记住的内容）\n")
+	}
+	return b.String()
+}
+
+// parseUserMemory 解析 memory.md，返回条目与手动备注。
+func parseUserMemory(content string) ([]Entry, string) {
+	var entries []Entry
+	lines := strings.Split(content, "\n")
+	kind := ""
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(line, "## ") {
+			title := strings.TrimPrefix(line, "## ")
+			if strings.TrimSpace(title) == "手动备注" {
+				manual := strings.TrimSpace(strings.Join(lines[i+1:], "\n"))
+				if strings.HasPrefix(manual, "（可在此处") {
+					manual = ""
+				}
+				return entries, manual
+			}
+			kind = sectionKind(title)
+			continue
+		}
+		if !strings.HasPrefix(line, "- **") || kind == "" {
+			continue
+		}
+		rest := strings.TrimPrefix(line, "- **")
+		idx := strings.Index(rest, "**：")
+		if idx < 0 {
+			continue
+		}
+		key := strings.TrimSpace(rest[:idx])
+		value := strings.TrimSpace(rest[idx+len("**："):])
+		e := Entry{Kind: kind, Key: key, Value: value, Tags: []string{}}
+		if strings.HasPrefix(key, "[") {
+			if end := strings.Index(key, "]"); end > 0 {
+				e.ProjectID = strings.TrimSpace(key[1:end])
+				e.Key = strings.TrimSpace(key[end+1:])
+			}
+		}
+		if i+1 < len(lines) {
+			next := strings.TrimSpace(lines[i+1])
+			if strings.HasPrefix(next, "<!-- memory:") {
+				attrs := parseAttrs(next)
+				if v := attrs["id"]; v != "" {
+					e.ID = v
+				}
+				if v := attrs["kind"]; v != "" {
+					e.Kind = v
+				}
+				if v := attrs["source"]; v != "" {
+					e.Source = v
+				}
+				if v := attrs["tags"]; v != "" {
+					e.Tags = splitTags(v)
+				}
+				e.Pinned = attrs["pinned"] == "1"
+				if v := attrs["updated"]; v != "" {
+					if t, err := time.Parse(time.RFC3339, v); err == nil {
+						e.UpdatedAt = t
+					}
+				}
+				i++
+			}
+		}
+		if e.ID == "" {
+			e.ID = randomID("m")
+		}
+		if e.Source == "" {
+			e.Source = "manual"
+		}
+		if e.UpdatedAt.IsZero() {
+			e.UpdatedAt = time.Now()
+		}
+		entries = append(entries, e)
+	}
+	return entries, ""
+}
+
+func splitTags(s string) []string {
+	var out []string
+	for _, t := range strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == '，' || r == '、'
+	}) {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func (m *Manager) loadUserLocked() {
+	m.entries = nil
+	m.manual = ""
+	data, err := os.ReadFile(m.userFile())
+	if err == nil {
+		m.entries, m.manual = parseUserMemory(string(data))
+	}
+	if m.entries == nil {
+		m.entries = []Entry{}
+	}
+	if _, err := os.Stat(m.userFile()); err != nil {
+		_ = writeText(m.userFile(), renderUserMemory(m.entries, m.manual, time.Now()))
+	}
+}
+
+func (m *Manager) UserMemoryText() string { return m.Profile() }
+
+func (m *Manager) ReadMemoryFile(name string) (string, error) {
+	clean := filepath.Clean(strings.ReplaceAll(name, "\\", "/"))
+	if strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
+		return "", fmt.Errorf("非法路径")
+	}
+	// 兼容旧调用：裸文件名指向全局记忆目录。
+	switch clean {
+	case "memory.md", "MEMORY.md", "index.json", "user_profile.md", "long_term.json":
+		clean = "memory/" + clean
+	}
+	allowed := clean == "memory/memory.md" || clean == "memory/MEMORY.md" || clean == "memory/index.json" ||
+		clean == "memory/user_profile.md" || clean == "memory/long_term.json" ||
+		strings.HasPrefix(clean, "projects/") || strings.HasPrefix(clean, "sessions/")
+	if !allowed {
+		return "", fmt.Errorf("不允许读取该记忆文件")
+	}
+	data, err := os.ReadFile(filepath.Join(m.dataRoot(), filepath.FromSlash(clean)))
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
 
 type scoredEntry struct {
 	e Entry
@@ -243,7 +494,7 @@ func (m *Manager) snippet(e IndexEntry, keywords []string) string {
 	if e.File == "" {
 		return ""
 	}
-	data, err := os.ReadFile(filepath.Join(m.root, filepath.FromSlash(e.File)))
+	data, err := os.ReadFile(filepath.Join(m.dataRoot(), filepath.FromSlash(e.File)))
 	if err != nil {
 		return ""
 	}

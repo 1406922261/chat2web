@@ -12,20 +12,20 @@ import (
 	"sync"
 	"time"
 
-	"chat2web/internal/analyzer"
+	"chat2web/internal/agent/analyzer"
+	"chat2web/internal/agent/planner"
 	"chat2web/internal/config"
 	"chat2web/internal/generator"
 	"chat2web/internal/llm"
-	"chat2web/internal/mcp"
 	"chat2web/internal/memory"
 	"chat2web/internal/perf"
-	"chat2web/internal/planner"
 	"chat2web/internal/project"
-	"chat2web/internal/shell"
-	"chat2web/internal/skill"
 	"chat2web/internal/task"
 	"chat2web/internal/textutil"
 	"chat2web/internal/tools"
+	"chat2web/internal/tools/mcp"
+	"chat2web/internal/tools/shell"
+	"chat2web/internal/tools/skill"
 )
 
 // Event 是 Agent 推送给终端的过程事件。
@@ -116,20 +116,45 @@ func startHeartbeat(emit func(Event), step int) func() {
 	return func() { close(done) }
 }
 
+// appendToolFailure 把失败的工具调用追加到运行时日志，单行一条便于 grep。
+func appendToolFailure(path string, e Event) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	args := e.Args
+	if len(args) > 800 {
+		args = args[:800] + "…"
+	}
+	fmt.Fprintf(f, "%s tool=%s args=%s error=%s\n",
+		time.Now().Format("2006-01-02 15:04:05"), e.Name, args, textutil.Truncate(e.Text, 800))
+}
+
 // Run 执行完整链路：记忆检索 → 聊天分析 → 网页规划 → Skill 匹配 → 工具循环 → 启动测试 → 保存记忆。
 func (a *Agent) Run(ctx context.Context, req RunRequest, emit func(Event)) error {
 	var emitMu sync.Mutex
+	var toolLogPath string
 	rawEmit := emit
 	emit = func(e Event) {
 		emitMu.Lock()
+		// 工具调用失败写入运行时日志，便于事后定位是哪个工具、什么参数、什么错误。
+		if toolLogPath != "" && e.Type == "tool_result" && !e.OK {
+			appendToolFailure(toolLogPath, e)
+		}
 		rawEmit(e)
 		emitMu.Unlock()
+	}
+	// 规划、分析等非流式调用期间定期上报进度，避免终端长时间无反馈。
+	if a.LLM != nil {
+		a.LLM.OnProgress = func(text string) { emit(statusEvent(text)) }
 	}
 	if req.Project == nil {
 		err := errors.New("缺少项目上下文")
 		emit(Event{Type: "error", Text: err.Error(), Time: time.Now()})
 		return err
 	}
+	toolLogPath = filepath.Join(a.Cfg.RuntimeRoot, "tools", req.Project.ID+".log")
 	if strings.TrimSpace(req.Chat) == "" {
 		err := errors.New("聊天内容为空")
 		emit(Event{Type: "error", Text: err.Error(), Time: time.Now()})
@@ -279,8 +304,16 @@ func (a *Agent) Run(ctx context.Context, req RunRequest, emit func(Event)) error
 			emit(Event{Type: "error", Text: runErr.Error(), Time: time.Now()})
 		}
 	}
+	// 只要入口不是占位页，就尝试启动开发服务器并打开浏览器；
+	// 即使本轮任务以「未通过构建」结束，也让用户能直接看到已生成的部分。
 	if runErr == nil && mode == "llm" {
 		devURL, runErr = a.ensureRunnable(ctx, req.Project, plan.SiteName, dispatcher, emit)
+	} else if mode == "llm" && !placeholderApp(req.Project.Dir) {
+		if u, rerr := a.ensureRunnable(ctx, req.Project, plan.SiteName, dispatcher, emit); rerr != nil {
+			emit(warnEvent("预览服务未启动：" + rerr.Error()))
+		} else {
+			devURL = u
+		}
 	}
 	verifyMs := time.Since(phaseStart).Milliseconds()
 	collector.SetStage("verify", time.Duration(verifyMs)*time.Millisecond)
@@ -380,7 +413,7 @@ func (a *Agent) Run(ctx context.Context, req RunRequest, emit func(Event)) error
 	}
 	cancel()
 
-	if devURL != "" && runErr == nil {
+	if devURL != "" {
 		emit(Event{Type: "dev_url", Text: devURL, Time: time.Now()})
 	}
 

@@ -16,87 +16,69 @@ import (
 	"time"
 )
 
-type HistoryItem struct {
-	Time    time.Time `json:"time"`
-	Kind    string    `json:"kind"`
-	Summary string    `json:"summary"`
-}
-
-// 项目生命周期：
-//   - temporary：临时生成，默认状态，不进入正式项目列表
-//   - active：用户正在继续修改
-//   - saved：用户明确保存，永久保留
-//   - archived：用户主动归档，保留源码与记忆但不出现在活动列表
-const (
-	LifecycleTemporary = "temporary"
-	LifecycleActive    = "active"
-	LifecycleSaved     = "saved"
-	LifecycleArchived  = "archived"
-	LifecycleDeleted   = "deleted"
-)
-
-type Project struct {
-	ID            string        `json:"id"`
-	Name          string        `json:"name"`
-	Description   string        `json:"description"`
-	TechStack     []string      `json:"tech_stack"`
-	Status        string        `json:"status"`
-	Pages         []string      `json:"pages"`
-	DevURL        string        `json:"dev_url"`
-	DevPort       int           `json:"dev_port"`
-	SessionID     string        `json:"session_id"`
-	Lifecycle     string        `json:"lifecycle"`
-	PrevLifecycle string        `json:"prev_lifecycle,omitempty"`
-	SavedAt       *time.Time    `json:"saved_at,omitempty"`
-	ArchivedAt    *time.Time    `json:"archived_at,omitempty"`
-	LastOpenedAt  *time.Time    `json:"last_opened_at,omitempty"`
-	CreatedAt     time.Time     `json:"created_at"`
-	UpdatedAt     time.Time     `json:"updated_at"`
-	History       []HistoryItem `json:"history"`
-	Deleted       bool          `json:"deleted"`
-	Dir           string        `json:"dir"`
-}
-
-type FileNode struct {
-	Name     string     `json:"name"`
-	Path     string     `json:"path"`
-	IsDir    bool       `json:"is_dir"`
-	Size     int64      `json:"size"`
-	Children []FileNode `json:"children,omitempty"`
-}
-
-type Version struct {
-	File      string    `json:"file"`
-	Label     string    `json:"label"`
-	CreatedAt time.Time `json:"created_at"`
-	Size      int64     `json:"size"`
-}
-
 type Manager struct {
-	dataRoot      string
-	workspaceRoot string
-	trashRoot     string
-	exportRoot    string
-	mu            sync.RWMutex
-	cache         map[string]*Project
+	dataRoot     string
+	projectsRoot string
+	trashRoot    string
+	exportRoot   string
+	mu           sync.RWMutex
+	cache        map[string]*Project
 }
 
-func NewManager(dataRoot, workspaceRoot string) *Manager {
-	m := &Manager{
-		dataRoot:      dataRoot,
-		workspaceRoot: workspaceRoot,
-		trashRoot:     filepath.Join(filepath.Dir(workspaceRoot), ".trash"),
-		exportRoot:    filepath.Join(dataRoot, "exports"),
-		cache:         map[string]*Project{},
+func NewManager(dataRoot, projectsRoot string) *Manager {
+	if strings.TrimSpace(projectsRoot) == "" {
+		projectsRoot = filepath.Join(dataRoot, "projects")
 	}
-	_ = os.MkdirAll(filepath.Join(dataRoot, "projects"), 0o755)
-	_ = os.MkdirAll(workspaceRoot, 0o755)
+	m := &Manager{
+		dataRoot:     dataRoot,
+		projectsRoot: projectsRoot,
+		// 回收站统一放在 data/backups/trash，与迁移备份同处 data/backups。
+		trashRoot:  filepath.Join(dataRoot, "backups", "trash"),
+		exportRoot: filepath.Join(dataRoot, "exports"),
+		cache:      map[string]*Project{},
+	}
+	_ = os.MkdirAll(m.projectsRoot, 0o755)
 	_ = os.MkdirAll(m.trashRoot, 0o755)
 	_ = os.MkdirAll(m.exportRoot, 0o755)
 	return m
 }
 
-func (m *Manager) WorkspaceRoot() string { return m.workspaceRoot }
+// WorkspaceRoot 返回统一项目根目录，Shell/MCP 以此为工作区边界。
+func (m *Manager) WorkspaceRoot() string { return m.projectsRoot }
+
+// ProjectsRoot 返回项目根目录（data/projects）。
+func (m *Manager) ProjectsRoot() string { return m.projectsRoot }
+
+// TrashRoot 返回回收站目录（data/backups/trash）。
+func (m *Manager) TrashRoot() string { return m.trashRoot }
+
+// MigrateTrash 把旧回收站 data/projects/.trash 合并到 data/backups/trash。
+// 同名目录不覆盖，移入 conflicts/；旧目录仅在确认为空时删除。
+func (m *Manager) MigrateTrash() (int, error) {
+	legacy := filepath.Join(m.projectsRoot, ".trash")
+	if !dirExists(legacy) {
+		return 0, nil
+	}
+	entries, err := os.ReadDir(legacy)
+	if err != nil {
+		return 0, err
+	}
+	moved := 0
+	for _, entry := range entries {
+		src := filepath.Join(legacy, entry.Name())
+		dst := filepath.Join(m.trashRoot, entry.Name())
+		if _, err := os.Stat(dst); err == nil {
+			dst = filepath.Join(m.trashRoot, "conflicts", entry.Name())
+		}
+		if err := moveDir(src, dst); err != nil {
+			return moved, err
+		}
+		moved++
+	}
+	// os.Remove 只删除空目录；仍有残留文件时保留旧回收站。
+	_ = os.Remove(legacy)
+	return moved, nil
+}
 
 func (m *Manager) newID() string {
 	buf := make([]byte, 3)
@@ -104,13 +86,14 @@ func (m *Manager) newID() string {
 	return "project-" + time.Now().Format("20060102-150405") + "-" + hex.EncodeToString(buf)
 }
 
+// metaPath 项目元数据唯一存放位置：{project}/project.json。
 func (m *Manager) metaPath(id string) string {
-	return filepath.Join(m.dataRoot, "projects", id+".json")
+	return filepath.Join(m.ProjectDir(id), "project.json")
 }
 
-// ProjectDir 返回项目根目录，统一包含 project.json / memory.md / source / assets / output。
+// ProjectDir 返回项目根目录 data/projects/{id}，一个项目只对应一个目录。
 func (m *Manager) ProjectDir(id string) string {
-	return filepath.Join(m.workspaceRoot, id)
+	return filepath.Join(m.projectsRoot, id)
 }
 
 // SiteDir 返回项目的网站源代码目录（source 子目录）。
@@ -135,7 +118,7 @@ func (m *Manager) MemoryFile(id string) string {
 
 // LegacySiteDir 返回第一轮改造前的网站目录位置，仅用于迁移。
 func (m *Manager) LegacySiteDir(id string) string {
-	return filepath.Join(filepath.Dir(m.workspaceRoot), "generated-websites", id)
+	return filepath.Join(filepath.Dir(m.dataRoot), "workspace", "generated-websites", id)
 }
 
 func (m *Manager) ensureLayout(id string) error {
@@ -167,6 +150,9 @@ func (m *Manager) Create(name, description string) (*Project, error) {
 	if err := m.ensureLayout(id); err != nil {
 		return nil, err
 	}
+	if err := m.ensureMemoryFile(id, p.Name); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	m.cache[id] = p
 	m.mu.Unlock()
@@ -174,6 +160,16 @@ func (m *Manager) Create(name, description string) (*Project, error) {
 		return nil, err
 	}
 	return p, nil
+}
+
+// ensureMemoryFile 为新项目初始化 memory.md；已存在时不覆盖。
+func (m *Manager) ensureMemoryFile(id, name string) error {
+	path := m.MemoryFile(id)
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+	content := "# " + strings.TrimSpace(name) + " 项目记忆\n\n> 由 Chat2Web 自动维护，记录项目目标、技术栈、进度与重要决策。\n"
+	return os.WriteFile(path, []byte(content), 0o644)
 }
 
 // normalize 兼容旧数据：补齐生命周期与目录字段。
@@ -199,14 +195,32 @@ func (m *Manager) save(p *Project) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(m.metaPath(p.ID), data, 0o644); err != nil {
+	dir := m.ProjectDir(p.ID)
+	// 已删除项目的目录在回收站，元数据跟随目录写入，避免重建空项目。
+	if p.Deleted {
+		if _, statErr := os.Stat(dir); statErr != nil {
+			if matches := m.trashDirs(p.ID); len(matches) > 0 {
+				dir = matches[len(matches)-1]
+			}
+		}
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	// 项目目录内同步一份 project.json，保证目录自包含；已删除项目目录在回收站，不重建。
-	if info, statErr := os.Stat(m.ProjectDir(p.ID)); statErr == nil && info.IsDir() {
-		_ = os.WriteFile(filepath.Join(m.ProjectDir(p.ID), "project.json"), data, 0o644)
+	return os.WriteFile(filepath.Join(dir, "project.json"), data, 0o644)
+}
+
+// trashDirs 返回回收站中该项目的目录（按名称升序）。
+func (m *Manager) trashDirs(id string) []string {
+	matches, _ := filepath.Glob(filepath.Join(m.trashRoot, id+"-*"))
+	var dirs []string
+	for _, p := range matches {
+		if info, err := os.Stat(p); err == nil && info.IsDir() {
+			dirs = append(dirs, p)
+		}
 	}
-	return nil
+	sort.Strings(dirs)
+	return dirs
 }
 
 func (m *Manager) Update(p *Project) error {
@@ -236,26 +250,12 @@ func (m *Manager) Get(id string) (*Project, error) {
 	}
 	m.mu.RUnlock()
 
-	data, err := os.ReadFile(m.metaPath(id))
-	if err != nil {
-		return nil, errors.New("项目不存在")
+	paths := []string{m.metaPath(id)}
+	for _, dir := range m.trashDirs(id) {
+		paths = append(paths, filepath.Join(dir, "project.json"))
 	}
-	var p Project
-	if err := json.Unmarshal(data, &p); err != nil {
-		return nil, err
-	}
-	m.normalize(&p)
-	m.mu.Lock()
-	m.cache[id] = &p
-	m.mu.Unlock()
-	return &p, nil
-}
-
-func (m *Manager) List(includeDeleted bool) []*Project {
-	files, _ := filepath.Glob(filepath.Join(m.dataRoot, "projects", "*.json"))
-	out := make([]*Project, 0, len(files))
-	for _, f := range files {
-		data, err := os.ReadFile(f)
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
@@ -263,13 +263,54 @@ func (m *Manager) List(includeDeleted bool) []*Project {
 		if err := json.Unmarshal(data, &p); err != nil {
 			continue
 		}
-		if p.Deleted && !includeDeleted {
+		m.normalize(&p)
+		m.mu.Lock()
+		m.cache[id] = &p
+		m.mu.Unlock()
+		return &p, nil
+	}
+	return nil, errors.New("项目不存在")
+}
+
+// List 扫描项目目录读取元数据；开启 includeDeleted 时同时读取回收站项目。
+func (m *Manager) List(includeDeleted bool) []*Project {
+	out := m.scanProjects(m.projectsRoot)
+	if includeDeleted {
+		out = append(out, m.scanProjects(m.trashRoot)...)
+	} else {
+		kept := out[:0]
+		for _, p := range out {
+			if !p.Deleted {
+				kept = append(kept, p)
+			}
+		}
+		out = kept
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
+	return out
+}
+
+func (m *Manager) scanProjects(root string) []*Project {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var out []*Project
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(root, entry.Name(), "project.json"))
+		if err != nil {
+			continue
+		}
+		var p Project
+		if err := json.Unmarshal(data, &p); err != nil {
 			continue
 		}
 		m.normalize(&p)
 		out = append(out, &p)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
 	return out
 }
 
@@ -462,7 +503,7 @@ func (m *Manager) AddHistory(id, kind, summary string) {
 
 func (m *Manager) Snapshot(id, label string) (Version, error) {
 	src := m.SiteDir(id)
-	dir := filepath.Join(m.dataRoot, "projects", id, "versions")
+	dir := filepath.Join(m.dataRoot, "versions", id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return Version{}, err
 	}
@@ -483,7 +524,7 @@ func (m *Manager) Snapshot(id, label string) (Version, error) {
 }
 
 func (m *Manager) Versions(id string) []Version {
-	dir := filepath.Join(m.dataRoot, "projects", id, "versions")
+	dir := filepath.Join(m.dataRoot, "versions", id)
 	files, _ := filepath.Glob(filepath.Join(dir, "index-*.json"))
 	var out []Version
 	for _, f := range files {

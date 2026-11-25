@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"chat2web/internal/planner"
+	"chat2web/internal/agent/planner"
 )
 
 // writeBaselineSite 在模型未完成入口（App.tsx 仍为占位）时，依据规划生成可构建的基线站点。

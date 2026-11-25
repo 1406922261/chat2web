@@ -15,12 +15,12 @@ import (
 	"time"
 
 	"chat2web/internal/config"
-	"chat2web/internal/mcp"
 	"chat2web/internal/memory"
 	"chat2web/internal/project"
-	"chat2web/internal/shell"
-	"chat2web/internal/skill"
 	"chat2web/internal/textutil"
+	"chat2web/internal/tools/mcp"
+	"chat2web/internal/tools/shell"
+	"chat2web/internal/tools/skill"
 )
 
 // Deps 是每次 Agent 运行时的工具依赖，绑定当前项目目录。

@@ -1,14 +1,15 @@
 package generator
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"chat2web/internal/analyzer"
-	"chat2web/internal/planner"
+	"chat2web/internal/agent/analyzer"
+	"chat2web/internal/agent/planner"
 	"chat2web/internal/textutil"
 	"chat2web/internal/tools"
 )
@@ -273,3 +274,39 @@ a {
   text-decoration: none;
 }
 `
+
+type siteData struct {
+	SiteName     string             `json:"siteName"`
+	WebsiteType  string             `json:"websiteType"`
+	Summary      string             `json:"summary"`
+	Style        string             `json:"style"`
+	Theme        string             `json:"theme"`
+	Palette      []string           `json:"palette"`
+	Pages        []planner.PagePlan `json:"pages"`
+	Interactions []string           `json:"interactions"`
+	GeneratedAt  string             `json:"generatedAt"`
+	Source       string             `json:"source"`
+}
+
+func toSiteData(a *analyzer.Analysis, p *planner.SitePlan) siteData {
+	return siteData{
+		SiteName:     p.SiteName,
+		WebsiteType:  p.WebsiteType,
+		Summary:      p.Summary,
+		Style:        p.Style,
+		Theme:        p.Theme,
+		Palette:      p.Palette,
+		Pages:        p.Pages,
+		Interactions: p.Interactions,
+		GeneratedAt:  nowString(),
+		Source:       "chat transcript: " + a.Topic,
+	}
+}
+
+func marshalJSON(v any) string {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}

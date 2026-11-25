@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"chat2web/internal/analyzer"
+	"chat2web/internal/agent/analyzer"
 	"chat2web/internal/llm"
 	"chat2web/internal/project"
 )

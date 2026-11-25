@@ -3,7 +3,7 @@ package planner
 import (
 	"strings"
 
-	"chat2web/internal/analyzer"
+	"chat2web/internal/agent/analyzer"
 	"chat2web/internal/textutil"
 )
 

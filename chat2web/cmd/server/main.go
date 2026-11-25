@@ -12,15 +12,15 @@ import (
 	"time"
 
 	"chat2web/internal/agent"
-	"chat2web/internal/analyzer"
+	"chat2web/internal/agent/analyzer"
 	"chat2web/internal/config"
 	"chat2web/internal/llm"
-	"chat2web/internal/mcp"
 	"chat2web/internal/memory"
 	"chat2web/internal/project"
-	"chat2web/internal/shell"
-	"chat2web/internal/skill"
 	"chat2web/internal/textutil"
+	"chat2web/internal/tools/mcp"
+	"chat2web/internal/tools/shell"
+	"chat2web/internal/tools/skill"
 )
 
 const banner = `
@@ -75,26 +75,59 @@ func setup() (*app, error) {
 
 	// 先迁移项目目录，再把记忆指向项目内 memory.md，保证记忆与项目正确关联。
 	projects := project.NewManager(cfg.DataRoot, cfg.ProjectsRoot)
-	if rep := projects.MigrateLayout(
+	rep := projects.MigrateLayout(
 		filepath.Join(cfg.Root, "workspace", "generated-websites"),
+		filepath.Join(cfg.Root, "workspace", "projects"),
 		filepath.Join(cfg.MemoryRoot, "projects"),
-	); rep.Projects > 0 && (rep.MovedSource > 0 || rep.MovedMemory > 0 || rep.CopiedOutput > 0) {
-		fmt.Printf("[项目] 目录迁移完成：源码 %d、记忆 %d、成果 %d\n", rep.MovedSource, rep.MovedMemory, rep.CopiedOutput)
+	)
+	if len(rep.Details) > 0 || len(rep.Errors) > 0 {
+		fmt.Printf("[项目] 目录迁移：项目 %d、源码 %d、记忆 %d、成果 %d、合并元数据 %d\n",
+			rep.Projects, rep.MovedSource, rep.MovedMemory, rep.CopiedOutput, rep.MergedMetadata)
+		for _, d := range rep.Details {
+			fmt.Println("  -", d)
+		}
+		for _, e := range rep.Errors {
+			fmt.Println("  ! 迁移警告：", e)
+		}
+		if rep.BackupDir != "" {
+			fmt.Println("  备份目录：", rep.BackupDir)
+		}
+	}
+	// 旧回收站 data/projects/.trash 合并到 data/backups/trash，可恢复项目不丢失。
+	if moved, err := projects.MigrateTrash(); err != nil {
+		fmt.Println("[项目] 回收站迁移警告：", err)
+	} else if moved > 0 {
+		fmt.Printf("[项目] 已迁移 %d 个回收站项目到 %s\n", moved, projects.TrashRoot())
 	}
 
 	mem := memory.NewManager(cfg.MemoryRoot, client)
 	mem.Configure(memory.Options{
+		DataRoot:       cfg.DataRoot,
+		SessionsRoot:   cfg.SessionsRoot,
+		BackupsRoot:    cfg.BackupsRoot,
 		RuntimeRoot:    cfg.RuntimeRoot,
 		ReportsRoot:    cfg.ReportsRoot,
 		TasksRoot:      cfg.TasksRoot,
 		ProjectRoot:    cfg.ProjectsRoot,
 		PlaywrightDays: cfg.RetentionPlaywrightDays,
 		TaskDays:       cfg.RetentionTaskDays,
+		SessionDays:    cfg.RetentionSessionDays,
 		ReportsKeep:    cfg.ReportsKeep,
 		Budget:         cfg.MemoryTokenBudget,
 	})
 	if err := mem.Init(); err != nil {
 		return nil, fmt.Errorf("初始化长期记忆失败: %w", err)
+	}
+	if lr := mem.LastLayoutReport(); !lr.Empty() {
+		fmt.Printf("[记忆] 目录迁移：会话摘要 %d、备份 %d、旧摘要 %d、报告 %d、运行数据 %d、任务 %d、冲突 %d\n",
+			lr.MovedSessions, lr.MovedBackups, lr.MovedSummaries,
+			lr.MovedReports, lr.MovedRuntime, lr.MovedTasks, lr.Conflicts)
+		for _, d := range lr.Details {
+			fmt.Println("  -", d)
+		}
+		for _, e := range lr.Errors {
+			fmt.Println("  ! 迁移警告：", e)
+		}
 	}
 	// 启动时自动清理过期临时数据；长期记忆与项目产物不参与清理。
 	if rep := mem.CleanupMemory(); rep.DeletedFiles > 0 || rep.ArchivedFiles > 0 {
@@ -183,12 +216,17 @@ func (a *app) newTask() {
 			return
 		}
 	}
+	fmt.Println("\n未匹配到已有项目。普通对话不会自动创建项目。")
+	if !a.confirm("是否新建独立项目并开始生成", true) {
+		fmt.Println("已取消，未创建项目。")
+		return
+	}
 	p, err := a.projects.Create(textutil.TitleFromMessage(chat), "来自终端聊天内容")
 	if err != nil {
 		fmt.Println("创建项目失败：", err)
 		return
 	}
-	fmt.Printf("\n已创建临时项目：%s\n目录：%s\n\n", p.ID, p.Dir)
+	fmt.Printf("\n已创建项目：%s\n目录：%s\n\n", p.ID, a.projects.ProjectDir(p.ID))
 	a.runAgent(p, chat, false)
 }
 
@@ -284,6 +322,7 @@ func (a *app) runAgent(p *project.Project, chat string, modify bool) {
 	fmt.Println("Agent 开始分析聊天内容…")
 	start := time.Now()
 	var devURL string
+	devURLFresh := false
 
 	err := a.agent.Run(ctx, agent.RunRequest{
 		SessionID: p.SessionID,
@@ -293,13 +332,17 @@ func (a *app) runAgent(p *project.Project, chat string, modify bool) {
 		Modify:    modify,
 	}, func(e agent.Event) {
 		printEvent(e)
-		if e.Type == "dev_url" {
+		if e.Type == "dev_url" && e.Text != "" {
 			devURL = e.Text
+			devURLFresh = true
 		}
 	})
 
-	if proj, getErr := a.projects.Get(p.ID); getErr == nil && proj.DevURL != "" {
-		devURL = proj.DevURL
+	// 本轮没有启动新的开发服务器时，才回退到项目记录里的地址（可能已失效）。
+	if !devURLFresh {
+		if proj, getErr := a.projects.Get(p.ID); getErr == nil && proj.DevURL != "" {
+			devURL = proj.DevURL
+		}
 	}
 
 	// 任务结束后清理本次产生的浏览器调试截图；项目素材与最终成果不受影响。
@@ -312,6 +355,11 @@ func (a *app) runAgent(p *project.Project, chat string, modify bool) {
 	if err != nil {
 		fmt.Printf("任务未完成（耗时 %s）：%v\n", time.Since(start).Round(time.Second), err)
 		printFailureHints(err)
+		// 页面已经能跑起来时，即使任务停在「暂停」也直接打开，方便边看边继续修改。
+		if devURL != "" && devURLFresh {
+			fmt.Printf("预览地址：%s（已自动打开浏览器）\n", devURL)
+			openBrowser(devURL)
+		}
 	} else {
 		fmt.Printf("任务完成（耗时 %s）\n", time.Since(start).Round(time.Second))
 		if out, pubErr := a.projects.PublishOutput(p.ID); pubErr != nil {
@@ -647,7 +695,7 @@ func (a *app) manageMemory() {
 }
 
 func (a *app) showUserMemory() {
-	fmt.Printf("== 用户长期记忆（%s）==\n", filepath.Join(a.mem.Root(), "MEMORY.md"))
+	fmt.Printf("== 用户长期记忆（%s）==\n", filepath.Join(a.mem.Root(), "memory.md"))
 	fmt.Println(textutil.Truncate(a.mem.UserMemoryText(), 4000))
 	fmt.Printf("\n共 %d 条跨项目用户记忆（项目专属记忆见“查看项目记忆”）。\n", len(a.mem.UserEntries()))
 }
@@ -817,7 +865,7 @@ func (a *app) showSessionDigests() {
 		fmt.Printf("  摘要：%s\n", textutil.Truncate(d.Summary, 200))
 		fmt.Printf("  文件：%s（消息游标 %d）\n", d.File, d.Cursor)
 	}
-	fmt.Printf("\n共 %d 条会话摘要，目录：%s\n", len(list), filepath.Join(a.mem.Root(), "sessions"))
+	fmt.Printf("\n共 %d 条会话摘要，目录：%s\n", len(list), a.mem.SessionsRoot())
 }
 
 func splitInput(s string) []string {

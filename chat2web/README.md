@@ -20,7 +20,7 @@ Chat2Web AI 是一个以**终端为主要交互入口**的 AI 网页生成 Agent
 
 ```powershell
 cd chat2web
-go run ./cmd/main.go
+go run ./cmd/server
 ```
 
 启动后进入菜单：
@@ -67,7 +67,7 @@ LLM_TEMPERATURE=0.4
 
 也支持通用 OpenAI 兼容环境变量自动回退：`ARK_API_KEY`、`OPENAI_API_KEY`、`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY`、`DASHSCOPE_API_KEY`。程序会先读 `chat2web/.env`，再读工作区根目录 `.env`。
 
-> **当前环境实测**：火山方舟 Key 可用，但账号未开通 `.env` 中配置的 `deepseek-v4-pro-ga-260813`，接口返回 `ModelNotOpen`。请到方舟控制台开通该模型，或改用其他已开通模型/OpenAI 兼容服务。详见 [TEST_REPORT.md](TEST_REPORT.md)。
+> **当前环境实测**：火山方舟 Key 可用，但账号未开通 `.env` 中配置的 `deepseek-v4-pro-ga-260813`，接口返回 `ModelNotOpen`。请到方舟控制台开通该模型，或改用其他已开通模型/OpenAI 兼容服务。
 
 ### 两种生成模式
 
@@ -80,14 +80,14 @@ LLM_TEMPERATURE=0.4
 
 ## 核心能力
 
-### 聊天分析引擎（`internal/analyzer`）
+### 聊天分析引擎（`internal/agent/analyzer`）
 
 - 优先用 LLM 输出动态 JSON：`topic / category / summary / key_facts / sections / preferences / entities / website_type / tone / missing`。
 - 不写死旅游字段，`key_facts` 的 `kind/key` 由内容决定。
 - LLM 失败时回退到本地规则分析，并在终端显式提示。
 - 支持旅游、健身、学习、读书、项目、活动、产品、成长、会议、美食等类别，也允许模型创造新类别。
 
-### 网页规划引擎（`internal/planner`）
+### 网页规划引擎（`internal/agent/planner`）
 
 - 自主决定网站名称、类型、页面数量、页面结构、视觉风格、配色、交互与技术栈。
 - 不同主题生成不同结构，例如：
@@ -111,22 +111,24 @@ LLM_TEMPERATURE=0.4
 
 新增 Skill 只需创建目录与 `SKILL.md`，重启后自动生效。
 
-### 长期记忆（`data/memory/`）
+### 长期记忆（`data/memory/` + `data/sessions/`）
 
 ```
-data/memory/
-  MEMORY.md            # 用户长期记忆（跨项目偏好，可手动编辑手动备注）
-  index.json           # 轻量检索索引（记忆类型 / 项目 / 文件 / 关键词）
-  projects/            # 旧版项目记忆（未迁移时回退读取）
+data/
+  memory/
+    memory.md          # 全局长期记忆（跨项目偏好，可手动编辑手动备注）
+    index.json         # 轻量检索索引（记忆类型 / 项目 / 文件 / 关键词）
+  projects/{id}/
+    memory.md          # 项目长期记忆（跟随项目目录）
   sessions/YYYY-MM/    # 每个项目一份会话摘要，按月归档
-  backup/              # 迁移与清理备份，永不自动删除
+  backups/             # 迁移与清理备份，永不自动删除
 ```
 
-- 记忆分三层：用户长期记忆、项目长期记忆（`workspace/projects/{id}/memory.md`）、会话摘要。
-- 会话结束增量更新摘要；同一项目的多次会话合并为一份，历史原文不再永久保留。
+- 记忆分两层：全局长期记忆（`data/memory/memory.md`）与项目长期记忆（`data/projects/{id}/memory.md`）；会话摘要仅作过程记录。
+- 会话摘要写入 `data/sessions/`，与全局记忆解耦；同一项目的多次会话合并为一份，历史原文不再永久保留。
 - 新任务只按关键词检索相关记忆并限制注入预算，不会把所有历史塞进 Prompt。
 - 项目专属偏好会自动迁入该项目记忆，避免跨项目污染。
-- 临时数据（Playwright 日志、Shell 日志、调试截图、临时任务）放在 `data/runtime/`：Playwright 日志保留 3 天、任务数据 7 天、报告最多 10 份，长期记忆不自动过期。
+- 临时数据分两类：运行日志与截图在 `data/logs/runtime/`（Playwright 日志保留 3 天），报告成果在 `data/exports/reports/`（最多 10 份），任务状态在 `data/sessions/tasks/`（保留 7 天）；长期记忆不自动过期。
 
 ### MCP Client（`configs/mcp.json`）
 
@@ -141,9 +143,9 @@ data/memory/
 
 启用 fetch/git 需要安装 [uv](https://docs.astral.sh/uv/)，或把 `command/args` 换成你环境中的等价服务。MCP 工具在 Agent 中统一以 `mcp__server__tool` 命名注册。
 
-### Shell 执行（`internal/shell`）
+### Shell 执行（`internal/tools/shell`）
 
-- 基于 `os/exec`，限制在工作区 `workspace/` 内；
+- 基于 `os/exec`，限制在项目根 `data/projects/` 内；
 - 命令白名单（npm / npx / node / git 等）；
 - 危险命令与越界路径拦截；
 - 执行超时、输出长度限制；
@@ -155,50 +157,71 @@ data/memory/
 
 ```
 chat2web/
-  cmd/main.go                 # 终端菜单、多行输入、事件渲染、浏览器打开
+  cmd/server/main.go          # 终端菜单、多行输入、事件渲染、浏览器打开
+  cmd/admin/                  # 存储审计与迁移工具（默认只读，-apply 执行）
   internal/
     agent/                    # Agent 主循环、工具执行器、系统提示词
-    analyzer/                 # 聊天分析（LLM + 本地规则）
-    planner/                  # 网页规划（LLM + 本地规则）
+      analyzer/               # 聊天分析（LLM + 本地规则）
+      planner/                # 网页规划（LLM + 本地规则）
+    memory/                   # 全局记忆 / 项目记忆 / 摘要 / 检索 / 迁移
+    project/                  # 项目元数据、生命周期、统一目录、版本、回收站
+    session/                  # 会话摘要文件的落盘位置与读写
+    tools/                    # 工具目录
+      mcp/                    # MCP Client 与多 Server 管理
+      shell/                  # 安全 Shell 执行与进程管理
+      skill/                  # SKILL.md 扫描、匹配、上下文注入
     generator/                # 内容简报、离线渲染、文件校验
-    memory/                   # 长期记忆存储 / 摘要 / 检索
-    mcp/                      # MCP Client 与多 Server 管理
-    shell/                    # 安全 Shell 执行与进程管理
-    skill/                    # SKILL.md 扫描、匹配、上下文注入
-    project/                  # 项目元数据、生命周期、统一目录、文件树、版本、回收站
-    tools/                    # 内置工具与 React/Vite/Tailwind 模板
-    llm/                      # OpenAI 兼容流式 Chat + Tool Calling
     config/                   # .env 加载与目录初始化
-  cmd/admin/                  # 一次性数据盘点、清理与目录迁移工具
+    llm/                      # OpenAI 兼容流式 Chat + Tool Calling
+    task/                     # 每个会话的任务状态
+    textutil/                 # 文本清洗与关键词提取
+    perf/                     # 性能计时辅助
   skills/                     # 6 个技能文档
   configs/mcp.json
-  data/memory/                # 用户记忆 / 项目索引 / 会话摘要 / 备份
-  data/projects/              # 项目元数据注册表（与项目内 project.json 同步）
-  workspace/projects/         # 统一项目目录
+  data/                       # 运行时数据（见下）
   README.md
-  TEST_REPORT.md
   go.mod
+```
+
+运行时数据统一在 `data/` 下，`data/projects` 是唯一的项目存储位置：
+
+```
+data/
+  memory/
+    memory.md      # 全局长期记忆
+    index.json     # 轻量检索索引
+  projects/
+    project-xxx/
+      assets/      # 素材
+      source/      # 网页源代码（React / Vite）
+      output/      # 最终构建成果
+      memory.md    # 项目记忆
+      project.json # 项目元数据（唯一来源）
+  sessions/        # 会话摘要（YYYY-MM/）与任务状态（tasks/）
+  logs/            # 运行日志与截图（runtime/）
+  exports/         # 报告等产出（reports/）
+  backups/         # 迁移与清理备份、回收站（trash/）
 ```
 
 每个项目使用统一目录，反复修改同一个网页会复用同一个项目，不会不断新建：
 
 ```
-workspace/projects/{project-id}/
-  project.json   # 项目基本信息（元数据同步副本）
+data/projects/{project-id}/
+  project.json   # 项目元数据（唯一来源）
   memory.md      # 项目记忆
   source/        # 网页源代码（React / Vite）
   assets/        # 用户上传或需要保留的素材
   output/        # 最终构建成果（source/dist 复制而来）
 ```
 
-项目生命周期：`temporary`（临时生成）→ `active`（正在修改）→ `saved`（用户明确保存，永久保留）→ `archived`（主动归档）。归档与删除的项目目录会进入 `workspace/.trash/`，可随时恢复；清理前会写入 `data/memory/backup/`。
+项目生命周期：`temporary`（临时生成）→ `active`（正在修改）→ `saved`（用户明确保存，永久保留）→ `archived`（主动归档）。归档与删除的项目目录会进入 `data/backups/trash/`，可随时恢复；迁移前会写入 `data/backups/migrate-{ts}/`。
 
 ## 生成出的项目
 
 默认模板：React 18 + TypeScript + Vite 5 + Tailwind CSS 3 + react-router-dom。
 
 ```powershell
-cd workspace/projects/project-xxxx/source
+cd data/projects/project-xxxx/source
 npm install
 npm run dev
 npm run build
@@ -208,7 +231,7 @@ npm run build
 
 ## 安全说明
 
-- Agent 只能读写 `workspace/projects/{id}/source` 下的项目文件（长期记忆目录由 Agent 专用接口写入）。
+- Agent 只能读写 `data/projects/{id}/source` 下的项目文件（长期记忆目录由 Agent 专用接口写入）。
 - Shell 命令受白名单、超时与输出截断限制。
 - `data/`、`workspace/`、`.env` 已在 `.gitignore` 中排除。
 - 浏览器自动打开在沙箱环境中可能被拦截；程序会打印 URL 供手动访问。
@@ -219,8 +242,6 @@ npm run build
 go build ./...
 go test ./...
 ```
-
-真实端到端测试结果、页面结构对比、MCP 调用与 LLM 阻塞说明见 [TEST_REPORT.md](TEST_REPORT.md)。
 
 ## 已知限制
 

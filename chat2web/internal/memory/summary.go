@@ -3,7 +3,10 @@ package memory
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -101,17 +104,17 @@ func (m *Manager) SummarizeSession(ctx context.Context, sessionID, projectID, pr
 	merged := mergeDigest(exist, result, len(msgs), projectID, projectName)
 
 	m.mu.Lock()
-	if exist != nil && exist.File != "" {
+	if exist != nil && strings.EqualFold(filepath.Ext(exist.File), ".json") {
 		merged.File = exist.File
 	} else {
 		abs := m.summaryFile(sessionID)
-		rel, err := filepath.Rel(m.root, abs)
+		rel, err := filepath.Rel(m.dataRoot(), abs)
 		if err != nil {
-			rel = filepath.Join("sessions", time.Now().Format("2006-01"), safeName(sessionID)+".md")
+			rel = filepath.Join("sessions", time.Now().Format("2006-01"), safeName(sessionID)+".json")
 		}
 		merged.File = filepath.ToSlash(rel)
 	}
-	if err := writeText(filepath.Join(m.root, filepath.FromSlash(merged.File)), renderDigest(merged)); err != nil {
+	if err := writeJSON(filepath.Join(m.dataRoot(), filepath.FromSlash(merged.File)), merged); err != nil {
 		m.mu.Unlock()
 		return nil, err
 	}
@@ -140,46 +143,6 @@ func (m *Manager) SummarizeSession(ctx context.Context, sessionID, projectID, pr
 
 	result.File = merged.File
 	return result, nil
-}
-
-func (m *Manager) applyDigestToProject(projectID string, d *SessionDigest) {
-	if strings.TrimSpace(projectID) == "" || d == nil {
-		return
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	pm, ok := m.projects[projectID]
-	if !ok {
-		return
-	}
-	pm.Completed = appendUnique(pm.Completed, d.Completed, 12)
-	if len(d.OpenIssues) > 0 {
-		pm.OpenIssues = dedupe(d.OpenIssues)
-	}
-	if len(d.NextSteps) > 0 {
-		pm.NextSteps = dedupe(d.NextSteps)
-	}
-	for _, c := range d.Conclusions {
-		if historyContains(pm.Decisions, c) {
-			continue
-		}
-		pm.Decisions = append(pm.Decisions, HistoryItem{Time: time.Now(), Kind: "结论", Summary: c})
-	}
-	if len(pm.Decisions) > 20 {
-		pm.Decisions = pm.Decisions[len(pm.Decisions)-20:]
-	}
-	m.persistProjectLocked(pm)
-	m.refreshIndexLocked()
-	m.persistIndexLocked()
-}
-
-func historyContains(list []HistoryItem, summary string) bool {
-	for _, item := range list {
-		if strings.EqualFold(strings.TrimSpace(item.Summary), strings.TrimSpace(summary)) {
-			return true
-		}
-	}
-	return false
 }
 
 func buildTranscript(msgs []llm.Message) string {
@@ -391,4 +354,315 @@ func heuristicSummary(msgs []llm.Message) *SummaryResult {
 	}
 	res.Project = ProjectState{Status: "ready", Pages: pages, Notes: "由本地规则从对话中提取（未调用 LLM 摘要）。"}
 	return res
+}
+
+// loadDigestsLocked 读取按月归档的会话摘要；旧的 Markdown 摘要会转换为 JSON 并归档。
+func (m *Manager) loadDigestsLocked() {
+	m.digests = map[string]*SessionDigest{}
+	for _, f := range m.store().List() {
+		d, err := m.readDigestFile(f)
+		if err != nil || d == nil || d.SessionID == "" {
+			continue
+		}
+		if d.UpdatedAt.IsZero() {
+			if info, statErr := os.Stat(f); statErr == nil {
+				d.UpdatedAt = info.ModTime()
+			}
+		}
+		if old, ok := m.digests[d.SessionID]; !ok || old.UpdatedAt.Before(d.UpdatedAt) {
+			m.digests[d.SessionID] = d
+		}
+	}
+}
+
+// readDigestFile 读取单个会话摘要：优先 JSON；遇旧的 Markdown 摘要时解析后写成同名 JSON，
+// 再把旧文件移入 data/backups/legacy-session-md-{ts}/（保留相对路径）。转换失败时保留旧文件。
+func (m *Manager) readDigestFile(path string) (*SessionDigest, error) {
+	rel := m.indexFileFor(path)
+	if strings.EqualFold(filepath.Ext(path), ".json") {
+		var d SessionDigest
+		if err := readJSON(path, &d); err != nil {
+			return nil, err
+		}
+		d.File = rel
+		return &d, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	d := parseDigest(string(data), rel)
+	target := strings.TrimSuffix(path, filepath.Ext(path)) + ".json"
+	if exists(target) {
+		var existing SessionDigest
+		if err := readJSON(target, &existing); err != nil {
+			return d, nil
+		}
+		existing.File = m.indexFileFor(target)
+		_ = m.archiveLegacyDigest(path)
+		return &existing, nil
+	}
+	d.File = m.indexFileFor(target)
+	if err := writeJSON(target, d); err != nil {
+		// JSON 写入失败时保留 Markdown，继续使用解析结果。
+		d.File = rel
+		return d, nil
+	}
+	_ = m.archiveLegacyDigest(path)
+	return d, nil
+}
+
+// archiveLegacyDigest 把旧的 Markdown 摘要按相对路径移入备份目录，绝不删除。
+func (m *Manager) archiveLegacyDigest(path string) error {
+	rel, err := filepath.Rel(m.sessionsRoot(), path)
+	if err != nil {
+		rel = filepath.Base(path)
+	}
+	dir := filepath.Join(m.backupsRoot(), "legacy-session-md-"+time.Now().Format("20060102-150405"))
+	return movePath(path, filepath.Join(dir, rel))
+}
+
+func (m *Manager) readDigestLocked(d *SessionDigest) string {
+	if d == nil || d.File == "" {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(m.dataRoot(), filepath.FromSlash(d.File)))
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func (m *Manager) summaryFile(sessionID string) string {
+	return m.store().DigestPath(sessionID, time.Now())
+}
+
+// renderDigest 渲染 sessions/YYYY-MM/{session}.md（旧版 Markdown 摘要格式）。
+func renderDigest(d *SessionDigest) string {
+	var b strings.Builder
+	b.WriteString("# 会话摘要\n\n")
+	fmt.Fprintf(&b, "- 会话：%s\n", d.SessionID)
+	fmt.Fprintf(&b, "- 项目ID：%s\n", d.ProjectID)
+	if d.ProjectName != "" {
+		fmt.Fprintf(&b, "- 项目：%s\n", d.ProjectName)
+	}
+	fmt.Fprintf(&b, "- 更新时间：%s\n", d.UpdatedAt.Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(&b, "- 消息游标：%d\n", d.Cursor)
+	if len(d.Keywords) > 0 {
+		fmt.Fprintf(&b, "- 关键词：%s\n", strings.Join(d.Keywords, ", "))
+	}
+	b.WriteString("\n")
+	fmt.Fprintf(&b, "## 核心任务\n%s\n\n", orDash(d.CoreTask))
+	fmt.Fprintf(&b, "## 已完成工作\n%s\n\n", bullets(d.Completed))
+	fmt.Fprintf(&b, "## 重要结论\n%s\n\n", bullets(d.Conclusions))
+	fmt.Fprintf(&b, "## 未解决问题\n%s\n\n", bullets(d.OpenIssues))
+	fmt.Fprintf(&b, "## 下一步\n%s\n\n", bullets(d.NextSteps))
+	fmt.Fprintf(&b, "## 摘要\n%s\n", orDash(d.Summary))
+	return b.String()
+}
+
+// parseDigest 解析旧版 Markdown 会话摘要，用于一次性迁移到 JSON。
+func parseDigest(content, file string) *SessionDigest {
+	d := &SessionDigest{File: file}
+	lines := strings.Split(content, "\n")
+	section := ""
+	var buf []string
+	flush := func() {
+		body := strings.TrimSpace(strings.Join(buf, "\n"))
+		buf = nil
+		switch section {
+		case "核心任务":
+			d.CoreTask = cleanDash(body)
+		case "已完成工作":
+			d.Completed = parseBullets(body)
+		case "重要结论":
+			d.Conclusions = parseBullets(body)
+		case "未解决问题":
+			d.OpenIssues = parseBullets(body)
+		case "下一步":
+			d.NextSteps = parseBullets(body)
+		case "摘要":
+			d.Summary = cleanDash(body)
+		}
+	}
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		switch {
+		case strings.HasPrefix(line, "- 会话："):
+			d.SessionID = strings.TrimSpace(strings.TrimPrefix(line, "- 会话："))
+		case strings.HasPrefix(line, "- 项目ID："):
+			d.ProjectID = strings.TrimSpace(strings.TrimPrefix(line, "- 项目ID："))
+		case strings.HasPrefix(line, "- 项目："):
+			d.ProjectName = strings.TrimSpace(strings.TrimPrefix(line, "- 项目："))
+		case strings.HasPrefix(line, "- 更新时间："):
+			if t, err := time.Parse("2006-01-02 15:04:05", strings.TrimSpace(strings.TrimPrefix(line, "- 更新时间："))); err == nil {
+				d.UpdatedAt = t
+			}
+		case strings.HasPrefix(line, "- 消息游标："):
+			d.Cursor, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "- 消息游标：")))
+		case strings.HasPrefix(line, "- 关键词："):
+			d.Keywords = splitTags(strings.TrimSpace(strings.TrimPrefix(line, "- 关键词：")))
+		case strings.HasPrefix(line, "## "):
+			flush()
+			section = strings.TrimPrefix(line, "## ")
+		default:
+			if section != "" {
+				buf = append(buf, raw)
+			}
+		}
+	}
+	flush()
+	if d.SessionID == "" {
+		name := filepathBase(file)
+		d.SessionID = strings.TrimSuffix(strings.TrimSuffix(name, ".md"), ".json")
+	}
+	return d
+}
+
+func filepathBase(p string) string {
+	p = strings.ReplaceAll(p, "\\", "/")
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
+// ConsolidateSessions 按项目合并重复会话摘要：每个项目只保留一份最新摘要，
+// 其余摘要文件移入 backup/sessions-{ts}/，不直接删除。
+// 直接扫描文件而不是内存索引，避免同会话 ID 的 legacy 文件互相覆盖。
+func (m *Manager) ConsolidateSessions() (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	type digestFile struct {
+		digest *SessionDigest
+		path   string
+	}
+	files := m.store().List()
+	groups := map[string][]digestFile{}
+	for _, f := range files {
+		d, err := m.readDigestFile(f)
+		if err != nil || d == nil {
+			continue
+		}
+		if d.UpdatedAt.IsZero() {
+			if info, statErr := os.Stat(f); statErr == nil {
+				d.UpdatedAt = info.ModTime()
+			}
+		}
+		key := d.ProjectID
+		if key == "" {
+			key = d.SessionID
+		}
+		groups[key] = append(groups[key], digestFile{digest: d, path: f})
+	}
+
+	backupDir := filepath.Join(m.backupsRoot(), "sessions-"+time.Now().Format("20060102-150405"))
+	moved := 0
+	changed := false
+
+	for projectID, list := range groups {
+		if len(list) < 2 {
+			continue
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i].digest.UpdatedAt.After(list[j].digest.UpdatedAt) })
+		merged := *list[0].digest
+		for _, item := range list[1:] {
+			d := item.digest
+			merged.Completed = mergeUnique(merged.Completed, d.Completed)
+			merged.Conclusions = mergeUnique(merged.Conclusions, d.Conclusions)
+			merged.OpenIssues = mergeUnique(merged.OpenIssues, d.OpenIssues)
+			merged.NextSteps = mergeUnique(merged.NextSteps, d.NextSteps)
+			merged.Keywords = mergeUnique(merged.Keywords, d.Keywords)
+			if strings.TrimSpace(d.Summary) != "" && len([]rune(d.Summary)) > len([]rune(merged.Summary)) {
+				merged.Summary = d.Summary
+			}
+			if strings.TrimSpace(merged.CoreTask) == "" && strings.TrimSpace(d.CoreTask) != "" {
+				merged.CoreTask = d.CoreTask
+			}
+			if merged.ProjectName == "" {
+				merged.ProjectName = d.ProjectName
+			}
+		}
+		merged.Completed = trimList(merged.Completed, 12)
+		merged.Keywords = trimList(merged.Keywords, 16)
+		if merged.UpdatedAt.IsZero() {
+			merged.UpdatedAt = time.Now()
+		}
+		name := "session-" + safeName(projectID)
+		if projectID == "" {
+			name = safeName(joinedSessionName(merged.SessionID, projectID))
+			merged.UpdatedAt = time.Now()
+		}
+		target := filepath.Join(m.sessionsRoot(), merged.UpdatedAt.Format("2006-01"), name+".json")
+		merged.File = m.indexFileFor(target)
+		if err := writeJSON(target, &merged); err != nil {
+			return moved, err
+		}
+		for _, item := range list {
+			if samePath(item.path, target) {
+				continue
+			}
+			if exists(item.path) {
+				if movePath(item.path, filepath.Join(backupDir, filepath.Base(item.path))) == nil {
+					moved++
+				}
+			}
+		}
+		changed = true
+	}
+	if changed {
+		m.loadDigestsLocked()
+		m.refreshIndexLocked()
+		m.persistIndexLocked()
+	}
+	return moved, nil
+}
+
+func joinedSessionName(sessionID, projectID string) string {
+	if strings.TrimSpace(sessionID) != "" {
+		return sessionID
+	}
+	if projectID != "" {
+		return "session-" + projectID
+	}
+	return "session-" + time.Now().Format("20060102-150405")
+}
+
+func samePath(a, b string) bool {
+	aa, errA := filepath.Abs(a)
+	bb, errB := filepath.Abs(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	return strings.EqualFold(aa, bb)
+}
+
+func mergeUnique(dst, src []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range dst {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	for _, s := range src {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+func trimList(list []string, max int) []string {
+	if len(list) <= max {
+		return list
+	}
+	return list[len(list)-max:]
 }
